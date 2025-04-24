@@ -65,10 +65,13 @@ if __name__ == "__main__":
 
     # load the input video frame by frame
     video = read_video_from_path(args.video_path)
+    print('Video read success...')
     video = torch.from_numpy(video).permute(0, 3, 1, 2)[None].float()
+    print('Torch permute success...')
     segm_mask = np.array(Image.open(os.path.join(args.mask_path)))
+    print('Image open success...')
     segm_mask = torch.from_numpy(segm_mask)[None, None]
-
+    print('Load video success...')
     if args.checkpoint is not None:
         if args.use_v2_model:
             model = CoTrackerPredictor(checkpoint=args.checkpoint, v2=args.use_v2_model)
@@ -85,10 +88,10 @@ if __name__ == "__main__":
             )
     else:
         model = torch.hub.load("facebookresearch/co-tracker", "cotracker3_offline")
-
+    print('Load model success...')
     model = model.to(DEFAULT_DEVICE)
     video = video.to(DEFAULT_DEVICE)
-
+    print('Starting prediction...')
     pred_tracks, pred_visibility = model(
         video,
         grid_size=args.grid_size,
