@@ -26,6 +26,26 @@ DEFAULT_DEVICE = (
     "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 )
 
+# 区域颜色对：(未移动色, 移动色)，BGR 格式
+REGION_COLORS = [
+    ((255, 0, 0), (0, 0, 255)),    # 区域 0: 蓝色未移动，红色移动
+    ((0, 255, 0), (0, 255, 255)),   # 区域 1: 绿色未移动，黄色移动
+    ((255, 255, 0), (255, 0, 255)), # 区域 2: 青色未移动，紫色移动
+    ((128, 128, 128), (255, 128, 0)) # 区域 3: 灰色未移动，橙色移动
+]
+
+# 颜色名称映射，用于日志
+COLOR_NAMES = {
+    (255, 0, 0): 'Blue',
+    (0, 0, 255): 'Red',
+    (0, 255, 0): 'Green',
+    (0, 255, 255): 'Yellow',
+    (255, 255, 0): 'Cyan',
+    (255, 0, 255): 'Purple',
+    (128, 128, 128): 'Gray',
+    (255, 128, 0): 'Orange'
+}
+
 # 初始化 NVML
 def initialize_nvml():
     try:
@@ -104,14 +124,13 @@ def read_video_with_ffmpeg_chunked(video_path, chunk_size=100):
         print(f"Error reading video: {e}")
         raise
 
-# 生成网格点并记录邻居关系
-def generate_grid_points(point1_x, point1_y, point2_x, point2_y, spacing, frame_number=0, width=1920, height=1080):
+# 生成网格点并记录邻居关系（仅用于初始 chunk）
+def generate_grid_points(point1_x, point1_y, point2_x, point2_y, spacing, frame_number=0, width=1920, height=1080, region_idx=0):
     min_x = min(point1_x, point2_x)
     max_x = max(point1_x, point2_x)
     min_y = min(point1_y, point2_y)
     max_y = max(point1_y, point2_y)
     
-    # 直接使用输入的 spacing 生成网格点
     x_coords = np.arange(min_x, max_x + spacing, spacing)
     y_coords = np.arange(min_y, max_y + spacing, spacing)
     
@@ -128,7 +147,7 @@ def generate_grid_points(point1_x, point1_y, point2_x, point2_y, spacing, frame_
     
     queries = torch.tensor(queries)
     if queries.shape[0] == 0:
-        raise ValueError("No valid grid points within video boundaries")
+        raise ValueError(f"No valid grid points within video boundaries for region {region_idx}")
     
     # 计算初始邻居关系和距离
     neighbors = {}
@@ -139,28 +158,24 @@ def generate_grid_points(point1_x, point1_y, point2_x, point2_y, spacing, frame_
                 continue
             idx = point_to_index[(i, j)]
             neighbor_list = []
-            # 上
             if i > 0 and (i-1, j) in point_to_index:
                 neighbor_idx = point_to_index[(i-1, j)]
                 neighbor_list.append(neighbor_idx)
                 dist = np.sqrt((queries[idx, 1] - queries[neighbor_idx, 1])**2 + 
                               (queries[idx, 2] - queries[neighbor_idx, 2])**2)
                 initial_distances[(idx, neighbor_idx)] = dist.item()
-            # 下
             if i < grid_shape[0] - 1 and (i+1, j) in point_to_index:
                 neighbor_idx = point_to_index[(i+1, j)]
                 neighbor_list.append(neighbor_idx)
                 dist = np.sqrt((queries[idx, 1] - queries[neighbor_idx, 1])**2 + 
                               (queries[idx, 2] - queries[neighbor_idx, 2])**2)
                 initial_distances[(idx, neighbor_idx)] = dist.item()
-            # 左
             if j > 0 and (i, j-1) in point_to_index:
                 neighbor_idx = point_to_index[(i, j-1)]
                 neighbor_list.append(neighbor_idx)
                 dist = np.sqrt((queries[idx, 1] - queries[neighbor_idx, 1])**2 + 
                               (queries[idx, 2] - queries[neighbor_idx, 2])**2)
                 initial_distances[(idx, neighbor_idx)] = dist.item()
-            # 右
             if j < grid_shape[1] - 1 and (i, j+1) in point_to_index:
                 neighbor_idx = point_to_index[(i, j+1)]
                 neighbor_list.append(neighbor_idx)
@@ -169,21 +184,48 @@ def generate_grid_points(point1_x, point1_y, point2_x, point2_y, spacing, frame_
                 initial_distances[(idx, neighbor_idx)] = dist.item()
             neighbors[idx] = neighbor_list
     
-    print(f"Generated {len(queries)} grid points with spacing {spacing:.2f}, grid shape: {grid_shape}")
+    print(f"Generated {len(queries)} grid points for region {region_idx} with spacing {spacing:.2f}, grid shape: {grid_shape}")
     return queries, grid_shape, neighbors, initial_distances, point_to_index
 
-# 计算间距变化并记录移动点
-def log_movement_matrix(pred_tracks, chunk_idx, global_frame_offset, grid_shape, neighbors, initial_distances, point_to_index, threshold):
-    print(f"\nProcessing movement for chunk {chunk_idx}")
+# 从上一 chunk 的结束位置生成新的 queries
+def generate_queries_from_last_positions(region, region_idx, frame_number=0, width=1920, height=1080):
+    if 'last_positions' not in region:
+        raise ValueError(f"No last_positions found for region {region_idx}. Ensure previous chunk was processed.")
+    
+    last_positions = region['last_positions']
+    num_points = len(last_positions)
+    queries = np.zeros((num_points, 3))
+    queries[:, 0] = frame_number  # 设置 frame_number 为 0
+    queries[:, 1:3] = last_positions  # 使用上一 chunk 结束时的 x, y 坐标
+    
+    # 验证坐标有效性
+    valid_mask = (0 <= queries[:, 1]) & (queries[:, 1] < width) & (0 <= queries[:, 2]) & (queries[:, 2] < height)
+    if not np.all(valid_mask):
+        invalid_count = np.sum(~valid_mask)
+        print(f"Warning: {invalid_count} points in region {region_idx} have invalid coordinates outside [0, {width}]x[0, {height}]")
+        queries[~valid_mask, 1:3] = region['queries'][~valid_mask, 1:3].cpu().numpy()  # 回退到初始位置
+    
+    queries = torch.tensor(queries, dtype=torch.float32)
+    
+    # 日志：记录新 queries 的坐标范围
+    min_x, max_x = queries[:, 1].min().item(), queries[:, 1].max().item()
+    min_y, max_y = queries[:, 2].min().item(), queries[:, 2].max().item()
+    print(f"Chunk {chunk_idx}, Region {region_idx}: New queries range x=[{min_x:.2f}, {max_x:.2f}], y=[{min_y:.2f}, {max_y:.2f}]")
+    
+    return queries
+
+# 计算间距变化并记录移动点，更新 last_positions
+def log_movement_matrix(pred_tracks, pred_visibility, chunk_idx, global_frame_offset, grid_shape, neighbors, initial_distances, point_to_index, threshold, region_idx=0):
+    print(f"\nProcessing movement for chunk {chunk_idx}, region {region_idx}")
     num_frames = pred_tracks.shape[1]
     num_points = pred_tracks.shape[2]
     
     # 初始化变化矩阵
     movement_matrix = np.zeros(grid_shape, dtype=int)
     moved_points = set()
-    moved_info = {}  # 按点记录首次移动
-    distance_changes = []  # 记录所有点的最大距离变化
-    moved_connections = []  # 记录超阈值的点对连接
+    moved_info = {}
+    distance_changes = []
+    moved_connections = []
     
     for frame_idx in range(num_frames):
         global_frame = global_frame_offset + frame_idx
@@ -204,9 +246,8 @@ def log_movement_matrix(pred_tracks, chunk_idx, global_frame_offset, grid_shape,
                     x2, y2 = pred_tracks[0, frame_idx, neighbor_idx, 0].item(), pred_tracks[0, frame_idx, neighbor_idx, 1].item()
                     current_dist = np.sqrt((x1 - x2)**2 + (y1 - y2)**2)
                     initial_dist = initial_distances.get((point_idx, neighbor_idx), current_dist)
-                    relative_change = current_dist - initial_dist  # 相对距离变化
+                    relative_change = current_dist - initial_dist
                     
-                    # 记录超阈值的连接
                     if relative_change > threshold:
                         moved_connections.append({
                             'frame': global_frame,
@@ -220,7 +261,7 @@ def log_movement_matrix(pred_tracks, chunk_idx, global_frame_offset, grid_shape,
                         max_neighbor_idx = neighbor_idx
                 
                 distance_changes.append(max_relative_change)
-                if max_relative_change > threshold:  # 使用命令行阈值
+                if max_relative_change > threshold:
                     movement_matrix[i, j] = 1
                     moved_points.add(point_idx)
                     moved_info[point_idx] = {
@@ -233,108 +274,118 @@ def log_movement_matrix(pred_tracks, chunk_idx, global_frame_offset, grid_shape,
                         'initial_dist': initial_dist
                     }
     
-    # 打印不带索引的矩阵
-    print(f"\nMovement matrix for chunk {chunk_idx} (without index, 1=moved, 0=unmoved):")
-    for i in range(grid_shape[0]):
-        row = []
-        for j in range(grid_shape[1]):
-            if (i, j) in point_to_index:
-                row.append(str(movement_matrix[i, j]))
-            else:
-                row.append("-")
-        print(' '.join(row))
-    
-    # 打印带索引的矩阵
-    print(f"\nMovement matrix for chunk {chunk_idx} (with point index, 1=moved, 0=unmoved):")
-    for i in range(grid_shape[0]):
-        row = []
-        for j in range(grid_shape[1]):
-            if (i, j) in point_to_index:
-                point_idx = point_to_index[(i, j)]
-                row.append(f"{movement_matrix[i, j]}({point_idx})")
-            else:
-                row.append("-(-)")
-        print(' '.join(row))
-    
     # 汇总移动点信息
-    print(f"\nMoved points count for chunk {chunk_idx}: {len(moved_info)}")
+    print(f"\nMoved points count for region {region_idx}: {len(moved_info)}")
     if moved_info:
-        print(f"Moved points details:")
+        print(f"Moved points details for region {region_idx}:")
         for point_idx, move in moved_info.items():
             print(f"Point {point_idx}: Frame {move['frame']}: (x={move['x']:.2f}, y={move['y']:.2f}), "
                   f"Relative distance change to neighbor {move['neighbor_idx']}: {move['relative_change']:.4f} px "
                   f"(current: {move['current_dist']:.2f}, initial: {move['initial_dist']:.2f})")
     else:
-        print(f"Warning: No moved points detected. Consider lowering the threshold (currently {threshold} px).")
+        print(f"Warning: No moved points detected in region {region_idx}. Consider lowering the threshold (currently {threshold} px).")
     
     # 汇总超阈值连接信息
-    print(f"\nMoved connections count for chunk {chunk_idx}: {len(moved_connections)}")
+    print(f"\nMoved connections count for region {region_idx}: {len(moved_connections)}")
     if moved_connections:
-        print(f"Moved connections details:")
+        print(f"Moved connections details for region {region_idx}:")
         for conn in moved_connections:
             print(f"Frame {conn['frame']}: Point {conn['point_idx']} to Neighbor {conn['neighbor_idx']}, "
                   f"Relative change: {conn['relative_change']:.4f} px")
     
     # 调试：打印距离变化统计
     if distance_changes:
-        print(f"Distance change stats: min={min(distance_changes):.4f}, max={max(distance_changes):.4f}, "
+        print(f"Distance change stats for region {region_idx}: min={min(distance_changes):.4f}, max={max(distance_changes):.4f}, "
               f"mean={np.mean(distance_changes):.4f}, std={np.std(distance_changes):.4f}")
     
-    return movement_matrix, moved_points, moved_connections, initial_distances
+    # 更新 last_positions
+    last_positions = np.zeros((num_points, 2))
+    for i in range(num_points):
+        if pred_visibility[0, -1, i].item():
+            last_positions[i] = pred_tracks[0, -1, i, :].cpu().numpy()
+        else:
+            # 若不可见，使用上一 chunk 的位置或初始位置
+            last_positions[i] = (region['last_positions'][i] if 'last_positions' in region 
+                                 else region['queries'][i, 1:3].cpu().numpy())
+    print(f"Chunk {chunk_idx}, Region {region_idx}: Updated {len(last_positions)} points' last positions")
+    
+    return movement_matrix, moved_points, moved_connections, initial_distances, last_positions
 
 # 自定义视频可视化
-def custom_visualize(video, tracks, visibility, moved_points, moved_connections, neighbors, initial_distances, save_path, threshold=0.5, fps=30):
+def custom_visualize(video, tracks, visibility, regions, save_path, threshold=0.5, fps=30):
     print(f"Generating custom video at {save_path}")
     height, width = video.shape[3], video.shape[4]
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(save_path, fourcc, fps, (width, height))
     
     num_frames = min(video.shape[1], tracks.shape[1])
-    num_points = tracks.shape[2]
+    total_points = tracks.shape[2]
     
-    print(f"Visualizing {num_points} points, {len(moved_points)} marked as moved, {len(moved_connections)} logged connections")
+    # 合并所有区域的移动点和连接
+    all_moved_points = set()
+    all_moved_connections = []
+    for region in regions:
+        all_moved_points.update(region['moved_points'])
+        all_moved_connections.extend(region['moved_connections'])
+    
+    print(f"Visualizing {total_points} points across {len(regions)} regions, {len(all_moved_points)} marked as moved, "
+          f"{len(all_moved_connections)} logged connections")
+    
     for t in range(num_frames):
         frame = video[0, t].permute(1, 2, 0).cpu().numpy().astype(np.uint8)
         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         
-        # 动态绘制超阈值的连接线和距离文本
+        # 动态绘制连接线和距离文本
         connection_count = 0
-        for p in range(num_points):
-            if not visibility[0, t, p].item():
-                continue
-            x1, y1 = tracks[0, t, p, 0].item(), tracks[0, t, p, 1].item()
-            for n in neighbors[p]:
-                if not visibility[0, t, n].item() or n < p:  # 避免重复绘制
+        for region_idx, region in enumerate(regions):
+            start_idx = region['point_offset']
+            end_idx = start_idx + region['queries'].shape[0]
+            unmoved_color, moved_color = region['colors']
+            for p in range(start_idx, end_idx):
+                local_p = p - start_idx
+                if not visibility[0, t, p].item():
                     continue
-                x2, y2 = tracks[0, t, n, 0].item(), tracks[0, t, n, 1].item()
-                current_dist = np.sqrt((x1 - x2)**2 + (y1 - y2)**2)
-                initial_dist = initial_distances.get((p, n), current_dist)
-                relative_change = current_dist - initial_dist
-                if relative_change > threshold:
-                    # 绘制红色细线
-                    cv2.line(frame, (int(x1), int(y1)), (int(x2), int(y2)), color=(0, 0, 255), thickness=1)
-                    # 计算中点并绘制距离文本
-                    mid_x, mid_y = (x1 + x2) / 2, (y1 + y2) / 2
-                    text_pos = (int(mid_x + 10), int(mid_y - 10))  # 右上偏移
-                    # 确保文本不超出帧边界
-                    text_pos = (min(max(0, text_pos[0]), width - 80), min(max(0, text_pos[1]), height - 20))
-                    cv2.putText(frame, f"{current_dist:.2f} px", text_pos, 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-                    connection_count += 1
-                    # 调试：记录文本
-                    if t < 5:  # 仅前 5 帧记录
-                        print(f"Frame {t}: Point {p} to {n}: {current_dist:.2f} px at {text_pos}")
+                x1, y1 = tracks[0, t, p, 0].item(), tracks[0, t, p, 1].item()
+                for n in region['neighbors'][local_p]:
+                    global_n = n + start_idx
+                    if not visibility[0, t, global_n].item() or global_n < p:  # 避免重复绘制
+                        continue
+                    x2, y2 = tracks[0, t, global_n, 0].item(), tracks[0, t, global_n, 1].item()
+                    current_dist = np.sqrt((x1 - x2)**2 + (y1 - y2)**2)
+                    initial_dist = region['initial_distances'].get((local_p, n), current_dist)
+                    relative_change = current_dist - initial_dist
+                    if relative_change > threshold:
+                        cv2.line(frame, (int(x1), int(y1)), (int(x2), int(y2)), color=moved_color, thickness=1)
+                        mid_x, mid_y = (x1 + x2) / 2, (y1 + y2) / 2
+                        text_pos = (int(mid_x + 10), int(mid_y - 10))
+                        text_pos = (min(max(0, text_pos[0]), width - 80), min(max(0, text_pos[1]), height - 20))
+                        cv2.putText(frame, f"{current_dist:.2f} px", text_pos, 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, moved_color, 1)
+                        connection_count += 1
+                        if t < 5:
+                            print(f"Frame {t}, Region {region_idx}: Point {local_p} to {n}: {current_dist:.2f} px at {text_pos}")
+                    else:
+                        cv2.line(frame, (int(x1), int(y1)), (int(x2), int(y2)), color=unmoved_color, thickness=1)
+                        if t == 0:
+                            print(f"Frame {t}, Region {region_idx}: {COLOR_NAMES[unmoved_color]} line from Point {local_p} to {n}, "
+                                  f"relative change: {relative_change:.4f} px")
         
         # 绘制点
-        for p in range(num_points):
+        for p in range(total_points):
             if visibility[0, t, p].item():
                 x, y = int(tracks[0, t, p, 0].item()), int(tracks[0, t, p, 1].item())
-                color = (0, 0, 255) if p in moved_points else (255, 0, 0)  # 红=移动，蓝=未移动
-                cv2.circle(frame, (x, y), 5, color, -1)
-                # 调试：记录点颜色
-                if t == 0:  # 仅第一帧记录
-                    print(f"Point {p}: {'Moved (red)' if p in moved_points else 'Unmoved (blue)'}, "
-                          f"Position: ({x}, {y})")
+                for region_idx, region in enumerate(regions):
+                    start_idx = region['point_offset']
+                    if start_idx <= p < start_idx + region['queries'].shape[0]:
+                        unmoved_color, moved_color = region['colors']
+                        color = moved_color if p in all_moved_points else unmoved_color
+                        cv2.circle(frame, (x, y), 5, color, -1)
+                        if t == 0:
+                            local_p = p - start_idx
+                            print(f"Region {region_idx}, Point {local_p}: "
+                                  f"{'Moved (' + COLOR_NAMES[moved_color] + ')' if p in all_moved_points else 'Unmoved (' + COLOR_NAMES[unmoved_color] + ')'}, "
+                                  f"Position: ({x}, {y})")
+                        break
         
         print(f"Frame {t}: Drew {connection_count} connections")
         out.write(frame)
@@ -346,11 +397,9 @@ def custom_visualize(video, tracks, visibility, moved_points, moved_connections,
 if __name__ == "__main__":
     print("\n" + '-' * 10 + " Section starts here " + '-' * 10)
     parser = argparse.ArgumentParser()
-    parser.add_argument("--video_path", default="/home/surgicalai/Data/test5.mp4", help="path to a video")
-    parser.add_argument("--point1_x", type=float, default=850, help="X coordinate of first point")
-    parser.add_argument("--point1_y", type=float, default=400, help="Y coordinate of first point")
-    parser.add_argument("--point2_x", type=float, default=1050, help="X coordinate of second point")
-    parser.add_argument("--point2_y", type=float, default=800, help="Y coordinate of second point")
+    parser.add_argument("--video_path", default="/home/surgicalai/Data/test5.1-1.mp4", help="path to a video")
+    parser.add_argument("--points", type=float, nargs='+', default=[850, 400, 1050, 800], 
+                        help="List of points as [x1, y1, x2, y2, ...] for multiple regions")
     parser.add_argument("--spacing", type=float, default=10, help="Spacing between grid points")
     parser.add_argument("--threshold", type=float, default=5, help="Threshold for movement detection in px")
     parser.add_argument("--checkpoint", default=None, help="CoTracker model parameters")
@@ -364,11 +413,15 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     print(f"Arguments parsed: video_path={args.video_path}, chunk_size={args.chunk_size}, save_dir={args.save_dir}")
-    print(f"Grid points: Point1=({args.point1_x}, {args.point1_y}), Point2=({args.point2_x}, {args.point2_y}), Spacing={args.spacing}, Threshold={args.threshold}")
+    print(f"Regions: {len(args.points)//4} regions, Points: {args.points}, Spacing={args.spacing}, Threshold={args.threshold}")
 
     # 验证视频文件
     if not os.path.exists(args.video_path):
         raise FileNotFoundError(f"Video file not found: {args.video_path}")
+
+    # 验证点输入
+    if len(args.points) % 4 != 0:
+        raise ValueError("Number of points must be a multiple of 4 (x1, y1, x2, y2 per region)")
 
     # 获取视频尺寸
     probe = ffmpeg.probe(args.video_path)
@@ -376,19 +429,25 @@ if __name__ == "__main__":
     width = int(video_info['width'])
     height = int(video_info['height'])
 
-    # 生成网格点和邻居关系
-    queries, grid_shape, neighbors, initial_distances, point_to_index = generate_grid_points(
-        args.point1_x, args.point1_y,
-        args.point2_x, args.point2_y,
-        args.spacing,
-        width=width,
-        height=height
-    )
-    if torch.cuda.is_available():
-        queries = queries.cuda()
-    print(f"Queries defined, shape: {queries.shape}, device: {queries.device}")
-    print(f"Initial grid points: {queries.shape[0]}, Grid shape: {grid_shape}")
-
+    # 初始化区域（仅第一 chunk 使用网格点）
+    regions = []
+    total_points = 0
+    for i in range(0, len(args.points), 4):
+        point1_x, point1_y, point2_x, point2_y = args.points[i:i+4]
+        queries, grid_shape, neighbors, initial_distances, point_to_index = generate_grid_points(
+            point1_x, point1_y, point2_x, point2_y, args.spacing, width=width, height=height, region_idx=i//4
+        )
+        regions.append({
+            'queries': queries,
+            'grid_shape': grid_shape,
+            'neighbors': neighbors,
+            'initial_distances': initial_distances,
+            'point_to_index': point_to_index,
+            'point_offset': total_points,
+            'colors': REGION_COLORS[i//4 % len(REGION_COLORS)]
+        })
+        total_points += queries.shape[0]
+    
     # 初始化 NVML
     gpu_handle = initialize_nvml()
 
@@ -429,6 +488,34 @@ if __name__ == "__main__":
             pair_start_time = time.time()
             print(f"\nProcessing chunk {chunk_idx}, frames: {video_chunk.shape[0]}")
             
+            # 更新 queries（后续 chunk 使用 last_positions）
+            if chunk_idx > 0:
+                print(f"Updating queries for chunk {chunk_idx} using last positions")
+                updated_regions = []
+                total_points = 0
+                for i, region in enumerate(regions):
+                    queries = generate_queries_from_last_positions(
+                        region, region_idx=i, frame_number=0, width=width, height=height
+                    )
+                    updated_regions.append({
+                        'queries': queries,
+                        'grid_shape': region['grid_shape'],
+                        'neighbors': region['neighbors'],
+                        'initial_distances': region['initial_distances'],
+                        'point_to_index': region['point_to_index'],
+                        'point_offset': total_points,
+                        'colors': region['colors']
+                    })
+                    total_points += queries.shape[0]
+                regions = updated_regions
+            
+            # 合并所有区域的查询点
+            all_queries = torch.cat([r['queries'] for r in regions], dim=0)
+            if torch.cuda.is_available():
+                all_queries = all_queries.cuda()
+            print(f"Queries defined, shape: {all_queries.shape}, device: {all_queries.device}")
+            print(f"Total grid points: {total_points}, Regions: {len(regions)}")
+            
             # 转换视频块为张量
             print("Converting chunk to PyTorch tensor")
             video = torch.from_numpy(video_chunk).permute(0, 3, 1, 2)[None].float().to(DEFAULT_DEVICE)
@@ -449,7 +536,7 @@ if __name__ == "__main__":
             with torch.no_grad():
                 pred_tracks, pred_visibility = model(
                     video,
-                    queries=queries[None],
+                    queries=all_queries[None],
                     grid_size=args.grid_size,
                     grid_query_frame=args.grid_query_frame if chunk_idx == 0 else 0,
                     backward_tracking=args.backward_tracking,
@@ -469,18 +556,36 @@ if __name__ == "__main__":
                 )
             print(f"Chunk {chunk_idx} inference completed, tracks shape: {pred_tracks.shape}, model time: {model_time:.2f} seconds")
 
-            # 计算间距变化并记录
-            movement_matrix, moved_points, moved_connections, initial_distances = log_movement_matrix(
-                pred_tracks, chunk_idx, global_frame_offset, grid_shape, neighbors, 
-                initial_distances, point_to_index, args.threshold
-            )
+            # 为每个区域处理移动和日志，更新 last_positions
+            for region_idx, region in enumerate(regions):
+                start_idx = region['point_offset']
+                end_idx = start_idx + region['queries'].shape[0]
+                region_tracks = pred_tracks[:, :, start_idx:end_idx]
+                region_visibility = pred_visibility[:, :, start_idx:end_idx]
+                
+                movement_matrix, moved_points, moved_connections, initial_distances, last_positions = log_movement_matrix(
+                    region_tracks, region_visibility, chunk_idx, global_frame_offset, region['grid_shape'], 
+                    region['neighbors'], region['initial_distances'], region['point_to_index'], 
+                    args.threshold, region_idx
+                )
+                region['moved_points'] = {p + start_idx for p in moved_points}
+                region['moved_connections'] = [
+                    {
+                        'frame': conn['frame'],
+                        'point_idx': conn['point_idx'] + start_idx,
+                        'neighbor_idx': conn['neighbor_idx'] + start_idx,
+                        'relative_change': conn['relative_change']
+                    } for conn in moved_connections
+                ]
+                region['initial_distances'] = initial_distances
+                region['last_positions'] = last_positions
+            
             global_frame_offset += video_chunk.shape[0]
 
             # 自定义可视化
             print("Visualizing chunk with custom colors, dynamic lines, and distance text")
             chunk_save_path = os.path.join(save_dir, f"{seq_name}_chunk_{chunk_idx}.mp4")
-            custom_visualize(video, pred_tracks, pred_visibility, moved_points, moved_connections, neighbors, 
-                            initial_distances, chunk_save_path, args.threshold)
+            custom_visualize(video, pred_tracks, pred_visibility, regions, chunk_save_path, args.threshold)
             
             pair_time = time.time() - pair_start_time
             print(f"(Chunk total time: {pair_time:.2f} seconds)")

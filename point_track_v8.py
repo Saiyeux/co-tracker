@@ -201,7 +201,7 @@ def log_movement_matrix(pred_tracks, chunk_idx, global_frame_offset, grid_shape,
                 max_relative_change = 0.0
                 max_neighbor_idx = None
                 for neighbor_idx in neighbors[point_idx]:
-                    x2, y2 = pred_tracks[0, frame_idx, neighbor_idx, 0].item(), pred_tracks[0, frame_idx, neighbor_idx, 1].item()
+                    x2, y2 = pred_tracks[0, frame_idx, neighbor_idx, 0].item(), pred_tracks[0, frame_idx, point_idx, 1].item()
                     current_dist = np.sqrt((x1 - x2)**2 + (y1 - y2)**2)
                     initial_dist = initial_distances.get((point_idx, neighbor_idx), current_dist)
                     relative_change = current_dist - initial_dist  # 相对距离变化
@@ -232,29 +232,6 @@ def log_movement_matrix(pred_tracks, chunk_idx, global_frame_offset, grid_shape,
                         'current_dist': current_dist,
                         'initial_dist': initial_dist
                     }
-    
-    # 打印不带索引的矩阵
-    print(f"\nMovement matrix for chunk {chunk_idx} (without index, 1=moved, 0=unmoved):")
-    for i in range(grid_shape[0]):
-        row = []
-        for j in range(grid_shape[1]):
-            if (i, j) in point_to_index:
-                row.append(str(movement_matrix[i, j]))
-            else:
-                row.append("-")
-        print(' '.join(row))
-    
-    # 打印带索引的矩阵
-    print(f"\nMovement matrix for chunk {chunk_idx} (with point index, 1=moved, 0=unmoved):")
-    for i in range(grid_shape[0]):
-        row = []
-        for j in range(grid_shape[1]):
-            if (i, j) in point_to_index:
-                point_idx = point_to_index[(i, j)]
-                row.append(f"{movement_matrix[i, j]}({point_idx})")
-            else:
-                row.append("-(-)")
-        print(' '.join(row))
     
     # 汇总移动点信息
     print(f"\nMoved points count for chunk {chunk_idx}: {len(moved_info)}")
@@ -297,7 +274,7 @@ def custom_visualize(video, tracks, visibility, moved_points, moved_connections,
         frame = video[0, t].permute(1, 2, 0).cpu().numpy().astype(np.uint8)
         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         
-        # 动态绘制超阈值的连接线和距离文本
+        # 动态绘制连接线和距离文本
         connection_count = 0
         for p in range(num_points):
             if not visibility[0, t, p].item():
@@ -311,19 +288,23 @@ def custom_visualize(video, tracks, visibility, moved_points, moved_connections,
                 initial_dist = initial_distances.get((p, n), current_dist)
                 relative_change = current_dist - initial_dist
                 if relative_change > threshold:
-                    # 绘制红色细线
+                    # 绘制红色细线和距离文本
                     cv2.line(frame, (int(x1), int(y1)), (int(x2), int(y2)), color=(0, 0, 255), thickness=1)
-                    # 计算中点并绘制距离文本
                     mid_x, mid_y = (x1 + x2) / 2, (y1 + y2) / 2
                     text_pos = (int(mid_x + 10), int(mid_y - 10))  # 右上偏移
-                    # 确保文本不超出帧边界
                     text_pos = (min(max(0, text_pos[0]), width - 80), min(max(0, text_pos[1]), height - 20))
                     cv2.putText(frame, f"{current_dist:.2f} px", text_pos, 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
                     connection_count += 1
                     # 调试：记录文本
-                    if t < 5:  # 仅前 5 帧记录
+                    if t < 5:
                         print(f"Frame {t}: Point {p} to {n}: {current_dist:.2f} px at {text_pos}")
+                else:
+                    # 绘制蓝色细线
+                    cv2.line(frame, (int(x1), int(y1)), (int(x2), int(y2)), color=(255, 0, 0), thickness=1)
+                    # 调试：记录蓝色细线（仅首帧）
+                    if t == 0:
+                        print(f"Frame {t}: Blue line from Point {p} to {n}, relative change: {relative_change:.4f} px")
         
         # 绘制点
         for p in range(num_points):
@@ -332,11 +313,11 @@ def custom_visualize(video, tracks, visibility, moved_points, moved_connections,
                 color = (0, 0, 255) if p in moved_points else (255, 0, 0)  # 红=移动，蓝=未移动
                 cv2.circle(frame, (x, y), 5, color, -1)
                 # 调试：记录点颜色
-                if t == 0:  # 仅第一帧记录
+                if t == 0:
                     print(f"Point {p}: {'Moved (red)' if p in moved_points else 'Unmoved (blue)'}, "
                           f"Position: ({x}, {y})")
         
-        print(f"Frame {t}: Drew {connection_count} connections")
+        print(f"Frame {t}: Drew {connection_count} red connections")
         out.write(frame)
         del frame
     
