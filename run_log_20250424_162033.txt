@@ -1,0 +1,16 @@
+
+---------- Section starts here ----------
+Arguments parsed: video_path=/home/surgicalai/Data/test5.1-1.mp4, json_path=000000_tracking_points.json, chunk_size=100, save_dir=/home/surgicalai/Data/output/co-tracker
+Loaded JSON file: 000000_tracking_points.json, image: 000000.jpg, regions: 3
+Initialized region 0 with 786 tracking points
+Initialized region 1 with 632 tracking points
+Initialized region 2 with 243 tracking points
+Initialized 3 regions with total 1661 tracking points
+Initializing CoTracker model
+Model initialized and moved to cuda
+Output directory prepared: /home/surgicalai/Data/output/co-tracker
+
+Processing chunk 0, frames 0 to 99
+GPU memory before inference: 5838/16376 MB
+Processing failed: not enough values to unpack (expected 5, got 4)
+NVML shutdown completed

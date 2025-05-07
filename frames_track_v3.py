@@ -9,6 +9,8 @@ import torch
 import argparse
 import imageio.v3 as iio
 import numpy as np
+import time
+import glob  # 新增：用于读取图像文件列表
 
 from cotracker.utils.visualizer import Visualizer
 from cotracker.predictor import CoTrackerOnlinePredictor
@@ -21,9 +23,9 @@ DEFAULT_DEVICE = (
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--video_path",
-        default="./assets/apple.mp4",
-        help="path to a video",
+        "--image_dir",  # 修改：从 video_path 改为 image_dir
+        default="/home/surgicalai/Data/images_5/",  # 图像文件夹路径
+        help="path to a directory containing images",
     )
     parser.add_argument(
         "--checkpoint",
@@ -40,8 +42,15 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    if not os.path.isfile(args.video_path):
-        raise ValueError("Video file does not exist")
+    # 检查图像文件夹是否存在
+    if not os.path.isdir(args.image_dir):
+        raise ValueError("Image directory does not exist")
+
+    # 获取图像文件列表并排序（假设文件名按顺序命名，如 frame_001.jpg）
+    image_files = sorted(glob.glob(os.path.join(args.image_dir, "*.jpg")) + 
+                         glob.glob(os.path.join(args.image_dir, "*.png")))
+    if not image_files:
+        raise ValueError("No images found in the directory")
 
     if args.checkpoint is not None:
         model = CoTrackerOnlinePredictor(checkpoint=args.checkpoint)
@@ -66,14 +75,11 @@ if __name__ == "__main__":
             grid_query_frame=grid_query_frame,
         )
 
-    # Iterating over video frames, processing one window at a time:
+    # 逐帧读取图像，处理窗口
     is_first_step = True
-    for i, frame in enumerate(
-        iio.imiter(
-            args.video_path,
-            plugin="FFMPEG",
-        )
-    ):
+    for i, image_path in enumerate(image_files):
+        start_time = time.time()
+        frame = iio.imread(image_path)  # 读取单帧图像
         if i % model.step == 0 and i != 0:
             pred_tracks, pred_visibility = _process_step(
                 window_frames,
@@ -82,19 +88,23 @@ if __name__ == "__main__":
                 grid_query_frame=args.grid_query_frame,
             )
             is_first_step = False
+        processing_time = time.time() - start_time
+        print(f"Processing frame {i + 1}/{len(image_files)}: {image_path} (Time: {processing_time:.4f}s)")
         window_frames.append(frame)
-    # Processing the final video frames in case video length is not a multiple of model.step
-    pred_tracks, pred_visibility = _process_step(
-        window_frames[-(i % model.step) - model.step - 1 :],
-        is_first_step,
-        grid_size=args.grid_size,
-        grid_query_frame=args.grid_query_frame,
-    )
+    
+    # 处理最后一批帧
+    if window_frames:
+        pred_tracks, pred_visibility = _process_step(
+            window_frames[-(i % model.step) - model.step - 1 :] if i >= model.step else window_frames,
+            is_first_step,
+            grid_size=args.grid_size,
+            grid_query_frame=args.grid_query_frame,
+        )
 
     print("Tracks are computed")
 
-    # save a video with predicted tracks
-    seq_name = args.video_path.split("/")[-1]
+    # 保存可视化视频
+    seq_name = os.path.basename(args.image_dir)  # 使用文件夹名作为序列名
     video = torch.tensor(np.stack(window_frames), device=DEFAULT_DEVICE).permute(
         0, 3, 1, 2
     )[None]
